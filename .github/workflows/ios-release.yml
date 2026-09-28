@@ -1,0 +1,249 @@
+## OutWit — iOS signed archive and App Store Connect upload
+##
+## PHASE 2 of the no-Mac pipeline. Produces a REAL SIGNED .ipa and can upload it
+## to App Store Connect for TestFlight or submission.
+##
+## Put this file in the Tally-iOS repo at:  .github/workflows/ios-release.yml
+##
+## MANUAL TRIGGER ONLY. This deliberately does NOT run on push — you do not want
+## an App Store upload every time a file changes. Run it from the Actions tab
+## with "Run workflow", and tick "upload" only when you actually want the build
+## to reach App Store Connect. Leaving it unticked archives and signs without
+## uploading, which is the right way to test the signing half on its own.
+##
+## REQUIRED SECRETS (Settings > Secrets and variables > Actions):
+##   APPSTORE_API_KEY_ID       — the Key ID, e.g. ABCD123456
+##   APPSTORE_API_ISSUER_ID    — the Issuer ID (long UUID, shown above the table)
+##   APPSTORE_API_PRIVATE_KEY  — the ENTIRE contents of the .p8 file,
+##                               including the BEGIN and END lines
+##
+## Secrets are write-only: they never appear in logs and are not exposed to
+## workflows triggered from forks, which is why a public repo is fine here.
+##
+## HOW SIGNING WORKS HERE — no .p12 and no provisioning profile needed. The
+## project already uses CODE_SIGN_STYLE = Automatic, so xcodebuild is given the
+## App Store Connect API key and -allowProvisioningUpdates, and it creates and
+## downloads the distribution certificate and profile itself. One credential
+## instead of three.
+
+name: iOS release (signed archive + upload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Upload the build to App Store Connect (leave unticked to only archive and sign)"
+        type: boolean
+        default: false
+
+env:
+  XCODE_DIR: src
+  WORKSPACE: OutWit.xcworkspace
+  SCHEME: OutWit
+  TEAM_ID: K3DM32S2MF
+  BUNDLE_ID: io.github.tallytracker.outwit
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: xcodebuild -version
+
+      # OUTWIT GUARD (28 Sep 2026): the repo started with a placeholder
+      # GoogleService-Info.plist so the smoke test could compile before the
+      # iOS app existed in Firebase. A release built with it crashes on launch.
+      - name: Refuse to release with the placeholder Firebase file
+        run: |
+          if grep -q "PLACEHOLDER\|PENDING" src/OutWit/GoogleService-Info.plist src/OutWit/Info.plist; then
+            echo "::error::GoogleService-Info.plist or the Google client IDs in Info.plist are still placeholders."
+            exit 1
+          fi
+
+      # xcodebuild and altool both expect the key at this exact path and
+      # filename. Written from a secret, so it never touches the repo.
+      - name: Install the App Store Connect API key
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/private_keys
+          printf '%s\n' "$PRIVATE_KEY" > ~/private_keys/AuthKey_${KEY_ID}.p8
+          echo "Key installed (contents not printed)."
+
+      - name: Install CocoaPods dependencies
+        working-directory: ${{ env.XCODE_DIR }}
+        run: pod install --repo-update
+
+      # THE ARCHIVE IS SIGNED NORMALLY AGAIN (13 Aug 2026). Rachel registered
+      # her iPhone 14 Pro as a device on the developer account, which removes
+      # the original blocker in one move.
+      #
+      # THE HISTORY, so nobody reopens any of it:
+      #   10 Aug, run #1: automatic signing asked Apple for an iOS App
+      #     DEVELOPMENT profile and failed — "Your team has no devices from
+      #     which to generate a provisioning profile". The account had none.
+      #   10 Aug, runs #2 and #3: setting CODE_SIGN_IDENTITY explicitly, first
+      #     on the command line and then in the pbxproj Release config, failed
+      #     both times — CODE_SIGN_STYLE = Automatic refuses ANY explicitly
+      #     specified identity, wherever it is set.
+      #   10 Aug: the workaround — archive with CODE_SIGNING_ALLOWED=NO and let
+      #     -exportArchive sign it. Builds shipped, but the archive had no
+      #     entitlements baked in and export applied only a minimal default set.
+      #     PROVEN by the entitlements dump on run #11: the binary carried
+      #     application-identifier, beta-reports-active, team-identifier and
+      #     get-task-allow and NOTHING else, while the provisioning profile
+      #     granted com.apple.developer.applesignin and aps-environment. iOS
+      #     checks the binary, so Sign in with Apple died with
+      #     ASAuthorizationError 1000 and push could never arrive.
+      #   12 Aug, run #12: ad-hoc signing the archive (CODE_SIGN_IDENTITY="-")
+      #     to bake entitlements in without a certificate. The SDK refuses it —
+      #     "Ad Hoc code signing is not allowed with SDK 'iOS 26.5'" — on the app
+      #     and all nine Pods targets. DO NOT RETRY.
+      #   12-13 Aug, runs #13 and #14: re-sign the app AFTER export, on the
+      #     assumption that cloud signing leaves the distribution certificate in
+      #     the runner keychain. Run #14 printed the keychain: "0 valid
+      #     identities found", "0 identities found". It leaves NOTHING behind.
+      #     That approach is impossible, not merely broken. DO NOT RETRY.
+      #
+      # WHY REGISTERING A DEVICE FIXES IT: archive with automatic signing wants
+      # a DEVELOPMENT profile, and a development profile cannot be issued to a
+      # team with an empty device list. One registered device and Apple will
+      # issue it, so -allowProvisioningUpdates plus the API key can now create
+      # the profile on demand and sign the archive properly. Entitlements are
+      # applied at signing time, so CODE_SIGN_ENTITLEMENTS (Entitlements.plist)
+      # is finally read. -exportArchive then re-signs with the App Store
+      # DISTRIBUTION profile, which needs no devices, and carries them through.
+      #
+      # If this ever fails again with "no devices", check the device list at
+      # developer.apple.com before changing anything here. The build number
+      # comes from github.run_number so it always increases.
+      - name: Archive (signed — entitlements baked in here)
+        working-directory: ${{ env.XCODE_DIR }}
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/OutWit.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${KEY_ID}.p8" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }}
+
+      - name: Write ExportOptions.plist
+        working-directory: ${{ env.XCODE_DIR }}
+        run: |
+          cat > ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>destination</key>
+            <string>export</string>
+          </dict>
+          </plist>
+          PLIST
+          cat ExportOptions.plist
+
+      # If this step fails complaining about the "method" value, the Xcode on
+      # the runner is older than the app-store-connect rename: change
+      # app-store-connect to app-store above and re-run.
+      - name: Export signed .ipa
+        working-directory: ${{ env.XCODE_DIR }}
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$PWD/build/OutWit.xcarchive" \
+            -exportPath "$PWD/build/export" \
+            -exportOptionsPlist ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${KEY_ID}.p8" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "$ISSUER_ID"
+          echo "Exported:"
+          ls -lh build/export
+
+      # PERMANENT DIAGNOSTIC — prove what entitlements the SIGNED binary
+      # actually carries. This step is the only reason the real fault was ever
+      # found: it showed run #11 shipping a binary with no
+      # com.apple.developer.applesignin and no aps-environment while the
+      # provisioning profile granted both. LEAVE IT IN, and read it after any
+      # signing or capability change.
+      #
+      # WHAT A GOOD RUN LOOKS LIKE NOW that the archive is signed properly:
+      # the BINARY section must list com.apple.developer.applesignin and
+      # aps-environment. If aps-environment reads "development" rather than
+      # "production", the export re-sign did not take and that needs fixing
+      # before the build is any use for push.
+      - name: Show the signed app's entitlements
+        working-directory: ${{ env.XCODE_DIR }}
+        run: |
+          set +e
+          IPA=$(find build/export -name "*.ipa" -print -quit)
+          echo "IPA: $IPA"
+          rm -rf /tmp/entcheck && mkdir -p /tmp/entcheck
+          unzip -q "$IPA" -d /tmp/entcheck
+          APP=$(find /tmp/entcheck/Payload -maxdepth 1 -name "*.app" -print -quit)
+          echo "APP: $APP"
+          echo "===== ENTITLEMENTS EMBEDDED IN THE SIGNED BINARY ====="
+          codesign -d --entitlements :- "$APP" 2>&1
+          echo "===== PROFILE ENTITLEMENTS ====="
+          security cms -D -i "$APP/embedded.mobileprovision" 2>/dev/null \
+            | plutil -extract Entitlements xml1 -o - - 2>&1
+          echo "====================================================="
+
+      - name: Upload the .ipa as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OutWit-ipa
+          path: ${{ env.XCODE_DIR }}/build/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      # Only runs when the "upload" box was ticked at trigger time.
+      - name: Upload to App Store Connect
+        if: ${{ inputs.upload }}
+        working-directory: ${{ env.XCODE_DIR }}
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
+        run: |
+          IPA=$(find build/export -name "*.ipa" -print -quit)
+          echo "Uploading $IPA"
+          xcrun altool --upload-app \
+            -f "$IPA" \
+            -t ios \
+            --apiKey "$KEY_ID" \
+            --apiIssuer "$ISSUER_ID"
+
+      - name: Summary
+        run: |
+          echo "### iOS release run complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Build number: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Uploaded to App Store Connect: ${{ inputs.upload }}" >> $GITHUB_STEP_SUMMARY
+          echo "- The signed .ipa is attached to this run as an artifact." >> $GITHUB_STEP_SUMMARY
