@@ -12,8 +12,7 @@
 ## uploading, which is the right way to test the signing half on its own.
 ##
 ## REQUIRED SECRETS (Settings > Secrets and variables > Actions):
-##   APPSTORE_API_KEY_ID       — the Key ID, e.g. ABCD123456
-##   APPSTORE_API_ISSUER_ID    — the Issuer ID (long UUID, shown above the table)
+##   (Key ID and Issuer ID are plain env values below - not secret.)
 ##   APPSTORE_API_PRIVATE_KEY  — the ENTIRE contents of the .p8 file,
 ##                               including the BEGIN and END lines
 ##
@@ -37,6 +36,13 @@ on:
         default: false
 
 env:
+  # OUTWIT, 28 Sep 2026: the Key ID and Issuer ID are NOT secret (they are shown
+  # on the App Store Connect page), so they live here in plain sight. The first
+  # release run failed with "ambiguous redirect" because the pasted Key ID
+  # secret carried whitespace, and a secret cannot be read back to check it.
+  # Only the private key stays a secret: APPSTORE_API_PRIVATE_KEY.
+  KEY_ID: 23K7MKBGRG
+  ISSUER_ID: e85abdfc-99ff-4b5b-a837-f76359a62d8d
   XCODE_DIR: src
   WORKSPACE: OutWit.xcworkspace
   SCHEME: OutWit
@@ -69,11 +75,11 @@ jobs:
       # filename. Written from a secret, so it never touches the repo.
       - name: Install the App Store Connect API key
         env:
-          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
           PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
         run: |
           mkdir -p ~/private_keys
-          printf '%s\n' "$PRIVATE_KEY" > ~/private_keys/AuthKey_${KEY_ID}.p8
+          printf '%s\n' "$PRIVATE_KEY" > "$HOME/private_keys/AuthKey_${KEY_ID}.p8"
+          head -1 "$HOME/private_keys/AuthKey_${KEY_ID}.p8" | grep -q "BEGIN PRIVATE KEY" || { echo "::error::APPSTORE_API_PRIVATE_KEY does not start with the BEGIN PRIVATE KEY line"; exit 1; }
           echo "Key installed (contents not printed)."
 
       - name: Install CocoaPods dependencies
@@ -125,9 +131,6 @@ jobs:
       # comes from github.run_number so it always increases.
       - name: Archive (signed — entitlements baked in here)
         working-directory: ${{ env.XCODE_DIR }}
-        env:
-          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
         run: |
           set -o pipefail
           xcodebuild archive \
@@ -171,9 +174,6 @@ jobs:
       # app-store-connect to app-store above and re-run.
       - name: Export signed .ipa
         working-directory: ${{ env.XCODE_DIR }}
-        env:
-          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
         run: |
           set -o pipefail
           xcodebuild -exportArchive \
@@ -228,9 +228,6 @@ jobs:
       - name: Upload to App Store Connect
         if: ${{ inputs.upload }}
         working-directory: ${{ env.XCODE_DIR }}
-        env:
-          KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APPSTORE_API_ISSUER_ID }}
         run: |
           IPA=$(find build/export -name "*.ipa" -print -quit)
           echo "Uploading $IPA"
