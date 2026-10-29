@@ -107,6 +107,26 @@ func calcWebviewFrame(webviewView: UIView, toolbarView: UIToolbar?) -> CGRect{
 }
 
 extension ViewController: WKUIDelegate, WKDownloadDelegate {
+    // MICROPHONE FOR SPAR — added 29 Oct 2026 (1.0.1).
+    // getUserMedia in WKWebView asks this delegate first. For OutWit's own
+    // pages we grant it here, so the user sees only iOS's own system prompt
+    // (worded by NSMicrophoneUsageDescription in Info.plist) instead of a
+    // second WebKit one. The web app itself asks for consent before the first
+    // recording (Apple 5.1.2(i)). Anything else, or the camera, falls back to
+    // the normal prompt.
+    @available(iOS 15.0, *)
+    func webView(_ webView: WKWebView,
+                 requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        if type == .microphone && allowedOrigins.contains(origin.host) {
+            decisionHandler(.grant)
+        } else {
+            decisionHandler(.prompt)
+        }
+    }
+
     // POPUP (window.open) SUPPORT — added 12 Aug 2026.
     //
     // PWABuilder ships this method returning nil and loading the request in the
