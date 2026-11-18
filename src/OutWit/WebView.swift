@@ -18,6 +18,8 @@ func createWebView(container: UIView, WKSMH: WKScriptMessageHandler, WKND: WKNav
     // here and gets the identity token back as an 'apple-signin-result' event.
     userContentController.add(WKSMH, name: "apple-signin")
     userContentController.add(WKSMH, name: "google-signin")
+    // In-app purchases for the paywall (18 Nov 2026) - see OutWitIAP in ViewController.swift.
+    userContentController.add(WKSMH, name: "iap")
 
     config.userContentController = userContentController
 

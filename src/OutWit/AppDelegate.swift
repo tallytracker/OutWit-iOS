@@ -20,6 +20,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // handlers in WebView.swift) was already complete and unused.
         FirebaseApp.configure()
 
+        // 18 Nov 2026: listen for App Store transactions (renewals, refunds, redeemed codes).
+        if #available(iOS 15.0, *) { OutWitIAP.shared.start() }
+
         // [START set_messaging_delegate]
         Messaging.messaging().delegate = self
         // [END set_messaging_delegate]

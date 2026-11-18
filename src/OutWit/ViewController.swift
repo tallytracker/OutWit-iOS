@@ -2,6 +2,7 @@ import UIKit
 import WebKit
 import AuthenticationServices
 import GoogleSignIn
+import StoreKit
 
 var webView: WKWebView! = nil
 
@@ -307,6 +308,9 @@ extension ViewController: WKScriptMessageHandler {
         if message.name == "google-signin" {
             handleGoogleSignIn()
         }
+        if message.name == "iap" {
+            if #available(iOS 15.0, *) { OutWitIAP.shared.handle(message.body) }
+        }
   }
 }
 
@@ -536,6 +540,115 @@ extension ViewController {
         DispatchQueue.main.async {
             OutWit.webView.evaluateJavaScript(
                 "window.dispatchEvent(new CustomEvent('apple-signin-result',{detail:'\(encoded)'}))"
+            )
+        }
+    }
+}
+
+// ===== IN-APP PURCHASE BRIDGE (added 18 Nov 2026, OutWit v203) =====
+//
+// The web app's paywall (index.html, PAYWALL_ON) talks to this through the "iap"
+// message handler and gets answers back as an 'iap-result' window event carrying
+// base64 JSON, the same hop the sign-in bridges use. StoreKit 2 (iOS 15+, which is
+// this project's deployment target). Actions:
+//   products     {ids}  -> {products:[{id, price}]}      price = localised displayPrice
+//   buy          {id}   -> {ok, id, expires?} | {ok:false, error:"cancelled"|"pending"|...}
+//   entitlements        -> {entitlements:[{id, expires?}]} what this Apple ID owns now
+//   restore             -> AppStore.sync(), then the same as entitlements
+//   redeem              -> Apple's offer-code sheet, then {ok:true}
+// No sign-in is involved anywhere: purchases belong to the Apple ID (Guideline 5.1.1(v)).
+
+@available(iOS 15.0, *)
+final class OutWitIAP {
+    static let shared = OutWitIAP()
+    private var updates: Task<Void, Never>? = nil
+
+    /// Started once at launch: finishes renewals, refunds and codes redeemed outside
+    /// the app, and tells the page what is owned now.
+    func start() {
+        if updates != nil { return }
+        updates = Task.detached {
+            for await result in Transaction.updates {
+                if case .verified(let t) = result { await t.finish() }
+                await OutWitIAP.shared.sendEntitlements(req: "update")
+            }
+        }
+    }
+
+    func handle(_ body: Any) {
+        guard let d = body as? [String: Any], let action = d["action"] as? String else { return }
+        let req = (d["req"] as? String) ?? ""
+        Task {
+            switch action {
+            case "products":
+                let ids = (d["ids"] as? [String]) ?? []
+                do {
+                    let ps = try await Product.products(for: ids)
+                    self.send(["req": req, "ok": true, "products": ps.map { ["id": $0.id, "price": $0.displayPrice] }])
+                } catch {
+                    self.send(["req": req, "ok": false, "error": "\(error)"])
+                }
+            case "buy":
+                guard let id = d["id"] as? String else { self.send(["req": req, "ok": false, "error": "no-id"]); return }
+                do {
+                    guard let p = try await Product.products(for: [id]).first else {
+                        self.send(["req": req, "ok": false, "error": "no-product"]); return
+                    }
+                    let r = try await p.purchase()
+                    switch r {
+                    case .success(let v):
+                        switch v {
+                        case .verified(let t):
+                            await t.finish()
+                            var out: [String: Any] = ["req": req, "ok": true, "id": t.productID]
+                            if let x = t.expirationDate { out["expires"] = Int(x.timeIntervalSince1970 * 1000) }
+                            self.send(out)
+                        case .unverified(_, _):
+                            self.send(["req": req, "ok": false, "error": "unverified"])
+                        }
+                    case .userCancelled:
+                        self.send(["req": req, "ok": false, "error": "cancelled"])
+                    case .pending:
+                        self.send(["req": req, "ok": false, "error": "pending"])
+                    @unknown default:
+                        self.send(["req": req, "ok": false, "error": "unknown"])
+                    }
+                } catch {
+                    self.send(["req": req, "ok": false, "error": "\(error)"])
+                }
+            case "restore":
+                do { try await AppStore.sync() } catch { }
+                await self.sendEntitlements(req: req)
+            case "entitlements":
+                await self.sendEntitlements(req: req)
+            case "redeem":
+                await MainActor.run { SKPaymentQueue.default().presentCodeRedemptionSheet() }
+                self.send(["req": req, "ok": true])
+            default:
+                self.send(["req": req, "ok": false, "error": "unknown-action"])
+            }
+        }
+    }
+
+    func sendEntitlements(req: String) async {
+        var list: [[String: Any]] = []
+        for await r in Transaction.currentEntitlements {
+            if case .verified(let t) = r, t.revocationDate == nil {
+                var e: [String: Any] = ["id": t.productID]
+                if let x = t.expirationDate { e["expires"] = Int(x.timeIntervalSince1970 * 1000) }
+                list.append(e)
+            }
+        }
+        send(["req": req, "ok": true, "entitlements": list])
+    }
+
+    func send(_ payload: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else { return }
+        let encoded = Data(json.utf8).base64EncodedString()
+        DispatchQueue.main.async {
+            OutWit.webView.evaluateJavaScript(
+                "window.dispatchEvent(new CustomEvent('iap-result',{detail:'\(encoded)'}))"
             )
         }
     }
