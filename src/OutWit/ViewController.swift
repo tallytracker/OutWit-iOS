@@ -621,6 +621,14 @@ final class OutWitIAP {
                 await self.sendEntitlements(req: req)
             case "entitlements":
                 await self.sendEntitlements(req: req)
+            case "manage":
+                // 1.1.0 build 5 (19 Nov 2026): Apple's own "manage or cancel" page, inside the app.
+                // Apple asks apps to offer this, and it is the ONLY way to cancel a TestFlight subscription.
+                let scene = await MainActor.run { UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first }
+                if let scene = scene {
+                    do { try await AppStore.showManageSubscriptions(in: scene) } catch { }
+                }
+                await self.sendEntitlements(req: req)
             case "redeem":
                 await MainActor.run { SKPaymentQueue.default().presentCodeRedemptionSheet() }
                 self.send(["req": req, "ok": true])
