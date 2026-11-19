@@ -601,7 +601,7 @@ final class OutWitIAP {
                         case .verified(let t):
                             await t.finish()
                             var out: [String: Any] = ["req": req, "ok": true, "id": t.productID]
-                            if let x = t.expirationDate { out["expires"] = Int(x.timeIntervalSince1970 * 1000) }
+                            if let x = t.expirationDate { out["expires"] = Int(x.timeIntervalSince1970 * 1000); out["renews"] = true }
                             self.send(out)
                         case .unverified(_, _):
                             self.send(["req": req, "ok": false, "error": "unverified"])
@@ -643,7 +643,21 @@ final class OutWitIAP {
         for await r in Transaction.currentEntitlements {
             if case .verified(let t) = r, t.revocationDate == nil {
                 var e: [String: Any] = ["id": t.productID]
-                if let x = t.expirationDate { e["expires"] = Int(x.timeIntervalSince1970 * 1000) }
+                if let x = t.expirationDate {
+                    e["expires"] = Int(x.timeIntervalSince1970 * 1000)
+                    // build 6 (19 Nov 2026): will it renew? Lets the page say "Cancelled - active until ..."
+                    // and warn a renewing subscriber who buys Lifetime that the subscription still bills.
+                    if let p = try? await Product.products(for: [t.productID]).first,
+                       let sub = p.subscription,
+                       let statuses = try? await sub.status {
+                        for st in statuses {
+                            if case .verified(let ri) = st.renewalInfo, ri.originalTransactionID == t.originalID {
+                                e["renews"] = ri.willAutoRenew
+                                if let next = ri.autoRenewPreference, next != t.productID { e["next"] = next }
+                            }
+                        }
+                    }
+                }
                 list.append(e)
             }
         }
